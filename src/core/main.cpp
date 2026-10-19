@@ -55,6 +55,7 @@
 
 #include <csignal>  // To register the signal handler
 
+#include "AgentWebSocketServer.h"
 #include "MainApplication.h"
 #include "ConfigManager.h"
 #include "DataFile.h"
@@ -912,7 +913,13 @@ int main( int argc, char * * argv )
 		}
 	}
 
+	// Start WebSocket server for AI agent control on port 8765
+	lmms::AgentWebSocketServer::instance()->start(8765);
+
 	const int ret = app->exec();
+
+	lmms::AgentWebSocketServer::instance()->stop();
+
 	delete app;
 
 	if( destroyEngine )

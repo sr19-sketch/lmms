@@ -35,6 +35,7 @@ namespace lmms
 
 class AudioBuffer;
 class Effect;
+class AgentWebSocketServer;
 
 namespace gui
 {
@@ -67,15 +68,28 @@ public:
 
 	void clear();
 
+	using EffectList = std::vector<Effect*>;
+	const EffectList& effects() const { return m_effects; }
+	int numOfEffects() const { return static_cast<int>(m_effects.size()); }
+	Effect* effect(int index) const
+	{
+		if (index >= 0 && index < static_cast<int>(m_effects.size()))
+		{
+			return m_effects[index];
+		}
+		return nullptr;
+	}
+	BoolModel* enabledModel() { return &m_enabledModel; }
+
 
 private:
-	using EffectList = std::vector<Effect*>;
 	EffectList m_effects;
 
 	BoolModel m_enabledModel;
 
 
 	friend class gui::EffectRackView;
+	friend class AgentWebSocketServer;
 
 
 signals:

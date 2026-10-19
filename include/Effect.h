@@ -40,6 +40,7 @@ namespace lmms
 class AudioBuffer;
 class EffectChain;
 class EffectControls;
+class AgentWebSocketServer;
 
 namespace gui
 {
@@ -128,6 +129,9 @@ public:
 		return &m_autoQuitModel;
 	}
 
+	BoolModel* enabledModel() { return &m_enabledModel; }
+	FloatModel* wetDryModel() { return &m_wetDryModel; }
+
 	bool autoQuitEnabled() const
 	{
 		return m_autoQuitEnabled;
@@ -208,11 +212,11 @@ private:
 	BoolModel m_enabledModel;
 	FloatModel m_wetDryModel;
 	TempoSyncKnobModel m_autoQuitModel;
-
 	bool m_autoQuitEnabled = false;
 
 	friend class gui::EffectView;
 	friend class EffectChain;
+	friend class AgentWebSocketServer;
 
 } ;
 

@@ -22,7 +22,7 @@ echo [INFO] Resuming LMMS compilation using UCRT64 toolchain...
 echo [INFO] CPU Cores: %NUMBER_OF_PROCESSORS%
 echo.
 
-call "%MSYS2_ROOT%\msys2_shell.cmd" -ucrt64 -defterm -no-start -here -c "cmake --build build -j %NUMBER_OF_PROCESSORS%"
+call "%MSYS2_ROOT%\msys2_shell.cmd" -ucrt64 -defterm -no-start -here -c "cmake --build build --target lmms -j %NUMBER_OF_PROCESSORS%"
 
 if %ERRORLEVEL% EQU 0 (
     echo.

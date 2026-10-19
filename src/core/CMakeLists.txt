@@ -1,6 +1,12 @@
 set(LMMS_SRCS
 	${LMMS_SRCS}
 
+	core/AgentWebSocketServer.cpp
+	core/AgentToolRegistry.cpp
+	core/AgentProjectTools.cpp
+	core/AgentTrackTools.cpp
+	core/AgentInstrumentTools.cpp
+	core/AgentMixerTools.cpp
 	core/AudioBuffer.cpp
 	core/AudioBusHandle.cpp
 	core/AudioEngine.cpp

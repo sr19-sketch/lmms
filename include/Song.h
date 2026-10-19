@@ -45,6 +45,7 @@
 namespace lmms
 {
 
+class AgentWebSocketServer;
 class AutomationTrack;
 class Keymap;
 class MidiClip;
@@ -462,6 +463,7 @@ private:
 	Metronome m_metronome;
 
 	friend class Engine;
+	friend class AgentWebSocketServer;
 	friend class gui::SongEditor;
 	friend class gui::ControllerRackView;
 

@@ -29,9 +29,13 @@
 #include "Timeline.h"
 #include "MeterModel.h"
 #include "TimePos.h"
+#include "ImportFilter.h"
+#include "Plugin.h"
 
 #include <QDir>
 #include <QFileInfo>
+#include <algorithm>
+#include <filesystem>
 
 namespace lmms
 {
@@ -552,6 +556,189 @@ static QJsonObject handleExportAudio(const QJsonObject& args, bool& ok, QString&
 	return data;
 }
 
+struct TimelineMarkerInfo
+{
+	double bar;
+	QString name;
+};
+static QList<TimelineMarkerInfo> s_timelineMarkers;
+
+static QJsonObject handleAddTimelineMarker(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	double bar = args.value(QStringLiteral("bar")).toDouble(0.0);
+	QString name = args.value(QStringLiteral("name")).toString().trimmed();
+	if (name.isEmpty())
+	{
+		name = QStringLiteral("Marker at Bar %1").arg(bar);
+	}
+
+	bool updated = false;
+	for (auto& m : s_timelineMarkers)
+	{
+		if (std::abs(m.bar - bar) < 0.001)
+		{
+			m.name = name;
+			updated = true;
+			break;
+		}
+	}
+
+	if (!updated)
+	{
+		s_timelineMarkers.append({ bar, name });
+	}
+
+	std::sort(s_timelineMarkers.begin(), s_timelineMarkers.end(), [](const TimelineMarkerInfo& a, const TimelineMarkerInfo& b) {
+		return a.bar < b.bar;
+	});
+
+	song->setModified();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Timeline marker '%1' added at bar %2.").arg(name).arg(bar);
+	data[QStringLiteral("bar")] = bar;
+	data[QStringLiteral("name")] = name;
+	data[QStringLiteral("total_markers")] = s_timelineMarkers.size();
+	return data;
+}
+
+static QJsonObject handleGetTimelineMarkers(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Q_UNUSED(args);
+	Q_UNUSED(errorMsg);
+
+	QJsonArray markersArr;
+	for (const auto& m : s_timelineMarkers)
+	{
+		QJsonObject mo;
+		mo[QStringLiteral("bar")] = m.bar;
+		mo[QStringLiteral("name")] = m.name;
+		markersArr.append(mo);
+	}
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("count")] = markersArr.size();
+	data[QStringLiteral("markers")] = markersArr;
+	return data;
+}
+
+static QJsonObject handleImportMidi(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	QString filePath = args.value(QStringLiteral("file_path")).toString().trimmed();
+	if (filePath.isEmpty())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Missing required parameter: 'file_path'.");
+		return QJsonObject();
+	}
+
+	QFileInfo fi(filePath);
+	if (!fi.exists())
+	{
+		QString userProjDir = ConfigManager::inst()->userProjectsDir();
+		QString testPath = userProjDir + QLatin1Char('/') + filePath;
+		if (QFileInfo::exists(testPath))
+		{
+			filePath = testPath;
+			fi = QFileInfo(filePath);
+		}
+	}
+
+	if (!fi.exists())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("MIDI file does not exist: '%1'.").arg(filePath);
+		return QJsonObject();
+	}
+
+	int prevTrackCount = static_cast<int>(song->tracks().size());
+	ImportFilter::import(filePath, song);
+	int newTrackCount = static_cast<int>(song->tracks().size());
+	int addedTracks = newTrackCount - prevTrackCount;
+
+	song->updateLength();
+	song->setModified();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("MIDI file imported successfully. %1 tracks created.").arg(addedTracks);
+	data[QStringLiteral("file_path")] = filePath;
+	data[QStringLiteral("tracks_added")] = addedTracks;
+	data[QStringLiteral("total_tracks")] = newTrackCount;
+	return data;
+}
+
+static QJsonObject handleExportMidi(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	QString filePath = args.value(QStringLiteral("file_path")).toString().trimmed();
+	if (filePath.isEmpty())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Missing required parameter: 'file_path'.");
+		return QJsonObject();
+	}
+
+	QFileInfo fi(filePath);
+	if (fi.isRelative())
+	{
+		QString userProjDir = ConfigManager::inst()->userProjectsDir();
+		filePath = userProjDir + QLatin1Char('/') + filePath;
+		fi = QFileInfo(filePath);
+	}
+
+	if (!filePath.endsWith(QStringLiteral(".mid"), Qt::CaseInsensitive) &&
+	    !filePath.endsWith(QStringLiteral(".midi"), Qt::CaseInsensitive))
+	{
+		filePath += QStringLiteral(".mid");
+		fi = QFileInfo(filePath);
+	}
+
+	fi.dir().mkpath(QStringLiteral("."));
+
+	song->exportProjectMidi(std::filesystem::path(filePath.toStdWString()));
+
+	QFileInfo outFi(filePath);
+	if (!outFi.exists() || outFi.size() == 0)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("MIDI export failed to produce a file at '%1'.").arg(filePath);
+		return QJsonObject();
+	}
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("MIDI file exported successfully.");
+	data[QStringLiteral("file_path")] = filePath;
+	data[QStringLiteral("file_size_bytes")] = static_cast<qint64>(outFi.size());
+	return data;
+}
+
 void registerProjectTools(AgentToolRegistry& reg)
 {
 	// 1. create_new_project
@@ -757,6 +944,83 @@ void registerProjectTools(AgentToolRegistry& reg)
 			props,
 			req,
 			handleExportAudio
+		);
+	}
+
+	// 11. add_timeline_marker
+	{
+		QJsonObject props;
+		QJsonObject propBar;
+		propBar[QStringLiteral("type")] = QStringLiteral("number");
+		propBar[QStringLiteral("description")] = QStringLiteral("Timeline bar position where the marker should be placed (0-indexed).");
+		props[QStringLiteral("bar")] = propBar;
+
+		QJsonObject propName;
+		propName[QStringLiteral("type")] = QStringLiteral("string");
+		propName[QStringLiteral("description")] = QStringLiteral("Descriptive name/label for the song section (e.g. 'Intro', 'Verse 1', 'Chorus', 'Build', 'Drop', 'Outro').");
+		props[QStringLiteral("name")] = propName;
+
+		QJsonArray req;
+		req.append(QStringLiteral("bar"));
+		req.append(QStringLiteral("name"));
+
+		reg.registerTool(
+			QStringLiteral("add_timeline_marker"),
+			QStringLiteral("Adds a labeled arrangement marker onto the song timeline ('Intro', 'Chorus', 'Drop', etc.) to enable structured composition."),
+			props,
+			req,
+			handleAddTimelineMarker
+		);
+	}
+
+	// 12. get_timeline_markers
+	{
+		reg.registerTool(
+			QStringLiteral("get_timeline_markers"),
+			QStringLiteral("Returns all labeled timeline arrangement markers in the project."),
+			QJsonObject(),
+			QJsonArray(),
+			handleGetTimelineMarkers
+		);
+	}
+
+	// 13. import_midi
+	{
+		QJsonObject props;
+		QJsonObject propFile;
+		propFile[QStringLiteral("type")] = QStringLiteral("string");
+		propFile[QStringLiteral("description")] = QStringLiteral("Path to standard MIDI file (.mid, .midi) on disk.");
+		props[QStringLiteral("file_path")] = propFile;
+
+		QJsonArray req;
+		req.append(QStringLiteral("file_path"));
+
+		reg.registerTool(
+			QStringLiteral("import_midi"),
+			QStringLiteral("Imports standard .mid/.midi files into the current LMMS song project using LMMS MIDI import filters."),
+			props,
+			req,
+			handleImportMidi
+		);
+	}
+
+	// 14. export_midi
+	{
+		QJsonObject props;
+		QJsonObject propFile;
+		propFile[QStringLiteral("type")] = QStringLiteral("string");
+		propFile[QStringLiteral("description")] = QStringLiteral("Path to save the exported standard MIDI (.mid) file.");
+		props[QStringLiteral("file_path")] = propFile;
+
+		QJsonArray req;
+		req.append(QStringLiteral("file_path"));
+
+		reg.registerTool(
+			QStringLiteral("export_midi"),
+			QStringLiteral("Exports all timeline tracks and notes to a Standard MIDI file (.mid) for use in other DAWs or external tools."),
+			props,
+			req,
+			handleExportMidi
 		);
 	}
 }

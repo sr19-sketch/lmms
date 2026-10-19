@@ -22,6 +22,7 @@
 #include "PluginFactory.h"
 #include "Plugin.h"
 #include "ConfigManager.h"
+#include "PatternStore.h"
 #include "DataFile.h"
 #include "AutomatableModel.h"
 
@@ -113,13 +114,16 @@ static QJsonObject handleLoadInstrument(const QJsonObject& args, bool& ok, QStri
 		}
 	}
 
+	bool inBBEditor = args.value(QStringLiteral("in_bb_editor")).toBool(false);
+	TrackContainer* tc = (inBBEditor && Engine::patternStore()) ? static_cast<TrackContainer*>(Engine::patternStore()) : static_cast<TrackContainer*>(song);
+
 	InstrumentTrack* it = nullptr;
 	int targetTrackIdx = -1;
 
 	if (args.contains(QStringLiteral("track_index")))
 	{
 		int reqIdx = args.value(QStringLiteral("track_index")).toInt();
-		const auto& tracks = song->tracks();
+		const auto& tracks = tc->tracks();
 		if (reqIdx >= 0 && reqIdx < static_cast<int>(tracks.size()))
 		{
 			it = dynamic_cast<InstrumentTrack*>(tracks[reqIdx]);
@@ -132,7 +136,7 @@ static QJsonObject handleLoadInstrument(const QJsonObject& args, bool& ok, QStri
 
 	if (!it)
 	{
-		Track* t = Track::create(Track::Type::Instrument, song);
+		Track* t = Track::create(Track::Type::Instrument, tc);
 		it = dynamic_cast<InstrumentTrack*>(t);
 		if (!it)
 		{
@@ -140,7 +144,7 @@ static QJsonObject handleLoadInstrument(const QJsonObject& args, bool& ok, QStri
 			errorMsg = QStringLiteral("Failed to create InstrumentTrack.");
 			return QJsonObject();
 		}
-		const auto& tracks = song->tracks();
+		const auto& tracks = tc->tracks();
 		for (size_t i = 0; i < tracks.size(); ++i)
 		{
 			if (tracks[i] == it)
@@ -542,6 +546,246 @@ static QJsonObject handleListPresets(const QJsonObject& args, bool& ok, QString&
 	return data;
 }
 
+static QJsonObject handleGetInstrumentParams(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	auto it = dynamic_cast<InstrumentTrack*>(t);
+	if (!it)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track at index %1 ('%2') is not an InstrumentTrack.").arg(trackIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	QList<AutomatableModel*> allModels = it->findChildren<AutomatableModel*>();
+	if (it->instrument())
+	{
+		allModels.append(it->instrument()->findChildren<AutomatableModel*>());
+	}
+
+	QJsonObject paramsObj;
+	QSet<AutomatableModel*> seen;
+
+	for (AutomatableModel* m : allModels)
+	{
+		if (!m || seen.contains(m)) continue;
+		seen.insert(m);
+
+		QString name = m->displayName();
+		if (name.isEmpty()) name = m->objectName();
+		if (name.isEmpty()) continue;
+
+		QJsonObject p;
+		p[QStringLiteral("value")] = m->value<float>();
+		p[QStringLiteral("min")] = m->minValue<float>();
+		p[QStringLiteral("max")] = m->maxValue<float>();
+		p[QStringLiteral("default")] = m->initValue<float>();
+		p[QStringLiteral("display_name")] = m->displayName();
+		p[QStringLiteral("object_name")] = m->objectName();
+
+		paramsObj[name] = p;
+	}
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("track_name")] = it->name();
+	data[QStringLiteral("instrument_name")] = it->instrumentName();
+	data[QStringLiteral("param_count")] = paramsObj.size();
+	data[QStringLiteral("params")] = paramsObj;
+	return data;
+}
+
+static QJsonObject handleSetTrackPitchRangeAndGlide(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	auto it = dynamic_cast<InstrumentTrack*>(t);
+	if (!it)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track at index %1 ('%2') is not an InstrumentTrack.").arg(trackIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	if (args.contains(QStringLiteral("pitch_range")))
+	{
+		int pitchRange = args.value(QStringLiteral("pitch_range")).toInt(1);
+		pitchRange = std::clamp(pitchRange, 1, 60);
+		it->pitchRangeModel()->setValue(pitchRange);
+	}
+
+	bool glideConfigured = false;
+	if (args.contains(QStringLiteral("glide_enabled")) || args.contains(QStringLiteral("glide_time_ms")))
+	{
+		bool glideEnabled = args.value(QStringLiteral("glide_enabled")).toBool(true);
+		double glideTime = args.value(QStringLiteral("glide_time_ms")).toDouble(50.0);
+
+		if (it->instrument())
+		{
+			QList<AutomatableModel*> models = it->instrument()->findChildren<AutomatableModel*>();
+			for (AutomatableModel* m : models)
+			{
+				if (!m) continue;
+				QString n = m->displayName().toLower().remove(QLatin1Char('_')).remove(QLatin1Char(' '));
+				QString objN = m->objectName().toLower().remove(QLatin1Char('_')).remove(QLatin1Char(' '));
+
+				if (n.contains(QStringLiteral("porta")) || n.contains(QStringLiteral("glide")) ||
+				    objN.contains(QStringLiteral("porta")) || objN.contains(QStringLiteral("glide")))
+				{
+					if (auto bm = dynamic_cast<BoolModel*>(m))
+					{
+						bm->setValue(glideEnabled);
+						glideConfigured = true;
+					}
+					else if (n.contains(QStringLiteral("time")) || objN.contains(QStringLiteral("time")))
+					{
+						m->setValue(static_cast<float>(glideTime));
+						glideConfigured = true;
+					}
+					else if (auto fm = dynamic_cast<FloatModel*>(m))
+					{
+						fm->setValue(glideEnabled ? static_cast<float>(glideTime) : 0.0f);
+						glideConfigured = true;
+					}
+				}
+			}
+		}
+	}
+
+	song->setModified();
+	emit it->dataChanged();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Updated pitch bend range and glide settings for track '%1'.").arg(it->name());
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("pitch_range_semitones")] = it->midiPitchRange();
+	data[QStringLiteral("glide_configured")] = glideConfigured;
+	return data;
+}
+
+static QJsonObject handleLoadSoundfontPatch(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	int bank = args.value(QStringLiteral("bank")).toInt(0);
+	int patch = args.value(QStringLiteral("patch")).toInt(0);
+
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	auto it = dynamic_cast<InstrumentTrack*>(t);
+	if (!it)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track at index %1 ('%2') is not an InstrumentTrack.").arg(trackIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	Instrument* inst = it->instrument();
+	if (!inst)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track '%1' does not have an active instrument loaded.").arg(it->name());
+		return QJsonObject();
+	}
+
+	bool applied = false;
+	AutomatableModel* bankM = inst->childModel("bank");
+	AutomatableModel* patchM = inst->childModel("patch");
+
+	if (bankM)
+	{
+		bankM->setValue(bank);
+		applied = true;
+	}
+	if (patchM)
+	{
+		patchM->setValue(patch);
+		applied = true;
+	}
+
+	if (!applied)
+	{
+		QList<AutomatableModel*> models = inst->findChildren<AutomatableModel*>();
+		for (AutomatableModel* m : models)
+		{
+			if (!m) continue;
+			QString n = m->objectName().toLower();
+			if (n == QStringLiteral("bank") || n.contains(QStringLiteral("bank")))
+			{
+				m->setValue(bank);
+				applied = true;
+			}
+			else if (n == QStringLiteral("patch") || n.contains(QStringLiteral("patch")) || n == QStringLiteral("program"))
+			{
+				m->setValue(patch);
+				applied = true;
+			}
+		}
+	}
+
+	QMetaObject::invokeMethod(inst, "updatePatch");
+
+	song->setModified();
+	emit it->dataChanged();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Loaded SoundFont patch (Bank %1, Patch %2) on track '%3'.")
+		.arg(bank).arg(patch).arg(it->name());
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("instrument_name")] = it->instrumentName();
+	data[QStringLiteral("bank")] = bank;
+	data[QStringLiteral("patch")] = patch;
+	data[QStringLiteral("success")] = applied;
+	return data;
+}
+
 void registerInstrumentTools(AgentToolRegistry& reg)
 {
 	// 1. list_available_instruments
@@ -571,7 +815,10 @@ void registerInstrumentTools(AgentToolRegistry& reg)
 		QJsonObject propPreset;
 		propPreset[QStringLiteral("type")] = QStringLiteral("string");
 		propPreset[QStringLiteral("description")] = QStringLiteral("Optional path to an instrument preset (.xpf) or soundfont (.sf2) file to load.");
-		props[QStringLiteral("preset_path")] = propPreset;
+		QJsonObject propInBB;
+		propInBB[QStringLiteral("type")] = QStringLiteral("boolean");
+		propInBB[QStringLiteral("description")] = QStringLiteral("If true, creates or loads the instrument inside the Beat+Bassline (Pattern) Editor rather than Song Editor.");
+		props[QStringLiteral("in_bb_editor")] = propInBB;
 
 		QJsonArray required;
 		required.append(QStringLiteral("instrument_name"));
@@ -662,6 +909,92 @@ void registerInstrumentTools(AgentToolRegistry& reg)
 			props,
 			QJsonArray(),
 			handleListPresets
+		);
+	}
+
+	// 6. get_instrument_params
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the target InstrumentTrack.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+
+		reg.registerTool(
+			QStringLiteral("get_instrument_params"),
+			QStringLiteral("Queries the current parameter values, envelope settings (AHDSR), filter cutoffs, and oscillator settings of an instrument track."),
+			props,
+			req,
+			handleGetInstrumentParams
+		);
+	}
+
+	// 7. set_track_pitch_range_and_glide
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the target InstrumentTrack.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propRange;
+		propRange[QStringLiteral("type")] = QStringLiteral("integer");
+		propRange[QStringLiteral("description")] = QStringLiteral("Pitch bend range in semitones (1 to 60).");
+		props[QStringLiteral("pitch_range")] = propRange;
+
+		QJsonObject propGlide;
+		propGlide[QStringLiteral("type")] = QStringLiteral("boolean");
+		propGlide[QStringLiteral("description")] = QStringLiteral("Enable or disable glide/portamento.");
+		props[QStringLiteral("glide_enabled")] = propGlide;
+
+		QJsonObject propTime;
+		propTime[QStringLiteral("type")] = QStringLiteral("number");
+		propTime[QStringLiteral("description")] = QStringLiteral("Glide duration/time in milliseconds.");
+		props[QStringLiteral("glide_time_ms")] = propTime;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+
+		reg.registerTool(
+			QStringLiteral("set_track_pitch_range_and_glide"),
+			QStringLiteral("Sets the pitch bend range (e.g. 12 or 24 semitones) and configures polyphonic/monophonic glide (portamento) for 808s and synths."),
+			props,
+			req,
+			handleSetTrackPitchRangeAndGlide
+		);
+	}
+
+	// 8. load_soundfont_patch
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the target InstrumentTrack running Sf2Player.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propBank;
+		propBank[QStringLiteral("type")] = QStringLiteral("integer");
+		propBank[QStringLiteral("description")] = QStringLiteral("SoundFont bank number (0 to 128).");
+		props[QStringLiteral("bank")] = propBank;
+
+		QJsonObject propPatch;
+		propPatch[QStringLiteral("type")] = QStringLiteral("integer");
+		propPatch[QStringLiteral("description")] = QStringLiteral("SoundFont patch/program number (0 to 127, e.g. 0 = Acoustic Grand Piano, 25 = Steel Guitar).");
+		props[QStringLiteral("patch")] = propPatch;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+		req.append(QStringLiteral("patch"));
+
+		reg.registerTool(
+			QStringLiteral("load_soundfont_patch"),
+			QStringLiteral("Selects a specific SoundFont Bank and Patch number inside an .sf2 / .sf3 SoundFont player instrument."),
+			props,
+			req,
+			handleLoadSoundfontPatch
 		);
 	}
 }

@@ -31,10 +31,16 @@
 #include "MidiClip.h"
 #include "ConfigManager.h"
 #include "Instrument.h"
+#include "PatternTrack.h"
+#include "PatternClip.h"
+#include "SampleBuffer.h"
 
 #include <QFileInfo>
 #include <QFile>
 #include <algorithm>
+#include <random>
+#include <cmath>
+#include <limits>
 
 namespace lmms
 {
@@ -598,7 +604,10 @@ static QJsonObject handleAddTrack(const QJsonObject& args, bool& ok, QString& er
 		return QJsonObject();
 	}
 
-	Track* t = Track::create(trackType, song);
+	bool inBBEditor = args.value(QStringLiteral("in_bb_editor")).toBool(false);
+	TrackContainer* tc = (inBBEditor && Engine::patternStore()) ? static_cast<TrackContainer*>(Engine::patternStore()) : static_cast<TrackContainer*>(song);
+
+	Track* t = Track::create(trackType, tc);
 	if (!t)
 	{
 		ok = false;
@@ -616,7 +625,7 @@ static QJsonObject handleAddTrack(const QJsonObject& args, bool& ok, QString& er
 	emit t->dataChanged();
 
 	int newTrackIdx = -1;
-	const auto& tracks = song->tracks();
+	const auto& tracks = tc->tracks();
 	for (size_t i = 0; i < tracks.size(); ++i)
 	{
 		if (tracks[i] == t)
@@ -1436,6 +1445,1151 @@ static QJsonObject handleControlTrack(const QJsonObject& args, bool& ok, QString
 	return data;
 }
 
+static QJsonObject handleModifyNotes(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	int clipIndex = args.value(QStringLiteral("clip_index")).toInt(-1);
+
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	if (clipIndex < 0 || clipIndex >= t->numOfClips())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip index %1 is out of range for track '%2'.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	Clip* c = t->getClip(clipIndex);
+	auto mc = dynamic_cast<MidiClip*>(c);
+	if (!mc)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip at index %1 on track '%2' is not a piano roll MidiClip.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	QJsonArray edits = args.value(QStringLiteral("edits")).toArray();
+	if (edits.isEmpty())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("'edits' array is missing or empty.");
+		return QJsonObject();
+	}
+
+	auto it = dynamic_cast<InstrumentTrack*>(t);
+	if (it) it->lock();
+
+	const auto& notesList = mc->notes();
+	int modifiedCount = 0;
+	int tpb = song->ticksPerBar();
+	double ticksPerBeat = static_cast<double>(tpb) / 4.0;
+
+	for (const QJsonValue& editVal : edits)
+	{
+		if (!editVal.isObject()) continue;
+		QJsonObject editObj = editVal.toObject();
+
+		int noteIdx = editObj.value(QStringLiteral("note_index")).toInt(-1);
+		if (noteIdx < 0 || noteIdx >= static_cast<int>(notesList.size()))
+		{
+			continue;
+		}
+
+		Note* n = const_cast<Note*>(notesList[noteIdx]);
+		if (!n) continue;
+
+		if (editObj.contains(QStringLiteral("key")))
+		{
+			bool keyOk = false;
+			int k = parseKeyStringOrInt(editObj.value(QStringLiteral("key")), keyOk);
+			if (keyOk) n->setKey(k);
+		}
+
+		if (editObj.contains(QStringLiteral("pos_tick")))
+		{
+			n->setPos(TimePos(std::max(0, editObj.value(QStringLiteral("pos_tick")).toInt())));
+		}
+		else if (editObj.contains(QStringLiteral("pos_beat")))
+		{
+			double pb = editObj.value(QStringLiteral("pos_beat")).toDouble();
+			n->setPos(TimePos(std::max(0, static_cast<int>(std::round(pb * ticksPerBeat)))));
+		}
+
+		if (editObj.contains(QStringLiteral("len_tick")))
+		{
+			n->setLength(TimePos(std::max(1, editObj.value(QStringLiteral("len_tick")).toInt())));
+		}
+		else if (editObj.contains(QStringLiteral("len_beat")))
+		{
+			double lb = editObj.value(QStringLiteral("len_beat")).toDouble();
+			n->setLength(TimePos(std::max(1, static_cast<int>(std::round(lb * ticksPerBeat)))));
+		}
+
+		if (editObj.contains(QStringLiteral("volume")))
+		{
+			int vol = editObj.value(QStringLiteral("volume")).toInt(100);
+			n->setVolume(static_cast<volume_t>(std::clamp(vol, 0, 200)));
+		}
+
+		if (editObj.contains(QStringLiteral("panning")))
+		{
+			int pan = editObj.value(QStringLiteral("panning")).toInt(0);
+			n->setPanning(static_cast<panning_t>(std::clamp(pan, -100, 100)));
+		}
+
+		modifiedCount++;
+	}
+
+	if (it) it->unlock();
+
+	mc->rearrangeAllNotes();
+	mc->updateLength();
+	song->updateLength();
+	song->setModified();
+	emit mc->dataChanged();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Successfully modified %1 notes in track %2 (clip %3).").arg(modifiedCount).arg(trackIndex).arg(clipIndex);
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("clip_index")] = clipIndex;
+	data[QStringLiteral("modified_count")] = modifiedCount;
+	data[QStringLiteral("total_notes")] = static_cast<int>(mc->notes().size());
+	return data;
+}
+
+static QJsonObject handleReplaceNotesInRange(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	int clipIndex = args.value(QStringLiteral("clip_index")).toInt(-1);
+
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	if (clipIndex < 0 || clipIndex >= t->numOfClips())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip index %1 is out of range for track '%2'.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	Clip* c = t->getClip(clipIndex);
+	auto mc = dynamic_cast<MidiClip*>(c);
+	if (!mc)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip at index %1 on track '%2' is not a piano roll MidiClip.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	int tpb = song->ticksPerBar();
+	double fromBar = args.value(QStringLiteral("from_bar")).toDouble(0.0);
+	double toBar = args.value(QStringLiteral("to_bar")).toDouble(fromBar);
+	int fromTick = static_cast<int>(std::round(fromBar * tpb));
+	int toTick = static_cast<int>(std::round(toBar * tpb));
+
+	if (toTick < fromTick) std::swap(fromTick, toTick);
+
+	NoteVector toRemove;
+	for (Note* n : mc->notes())
+	{
+		if (n && n->pos().getTicks() >= fromTick && n->pos().getTicks() < toTick)
+		{
+			toRemove.push_back(n);
+		}
+	}
+
+	int removedCount = 0;
+	for (Note* n : toRemove)
+	{
+		mc->removeNote(n);
+		removedCount++;
+	}
+
+	int addedCount = 0;
+	QJsonArray newNotes = args.value(QStringLiteral("new_notes")).toArray();
+	double ticksPerBeat = static_cast<double>(tpb) / 4.0;
+
+	for (const QJsonValue& nv : newNotes)
+	{
+		if (!nv.isObject()) continue;
+		QJsonObject no = nv.toObject();
+
+		bool keyOk = false;
+		int key = parseKeyStringOrInt(no.value(QStringLiteral("key")), keyOk);
+		if (!keyOk) continue;
+
+		int posTick = 0;
+		if (no.contains(QStringLiteral("pos_tick")))
+		{
+			posTick = no.value(QStringLiteral("pos_tick")).toInt(0);
+		}
+		else if (no.contains(QStringLiteral("pos_beat")))
+		{
+			posTick = static_cast<int>(std::round(no.value(QStringLiteral("pos_beat")).toDouble(0.0) * ticksPerBeat));
+		}
+		else if (no.contains(QStringLiteral("bar")))
+		{
+			posTick = static_cast<int>(std::round(no.value(QStringLiteral("bar")).toDouble(0.0) * tpb));
+		}
+		else
+		{
+			posTick = fromTick;
+		}
+
+		int lenTick = static_cast<int>(ticksPerBeat);
+		if (no.contains(QStringLiteral("len_tick")))
+		{
+			lenTick = no.value(QStringLiteral("len_tick")).toInt(static_cast<int>(ticksPerBeat));
+		}
+		else if (no.contains(QStringLiteral("len_beat")))
+		{
+			lenTick = static_cast<int>(std::round(no.value(QStringLiteral("len_beat")).toDouble(1.0) * ticksPerBeat));
+		}
+
+		volume_t vol = static_cast<volume_t>(no.value(QStringLiteral("volume")).toInt(DefaultVolume));
+		panning_t pan = static_cast<panning_t>(no.value(QStringLiteral("panning")).toInt(DefaultPanning));
+
+		Note newNote(TimePos(lenTick), TimePos(posTick), key, vol, pan);
+		mc->addNote(newNote, false);
+		addedCount++;
+	}
+
+	mc->rearrangeAllNotes();
+	mc->updateLength();
+	song->updateLength();
+	song->setModified();
+	emit mc->dataChanged();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Replaced notes in range [%1, %2) bars: removed %3, added %4.")
+		.arg(fromBar).arg(toBar).arg(removedCount).arg(addedCount);
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("clip_index")] = clipIndex;
+	data[QStringLiteral("from_bar")] = fromBar;
+	data[QStringLiteral("to_bar")] = toBar;
+	data[QStringLiteral("removed_notes")] = removedCount;
+	data[QStringLiteral("added_notes")] = addedCount;
+	data[QStringLiteral("total_notes")] = static_cast<int>(mc->notes().size());
+	return data;
+}
+
+static QJsonObject handleDeleteNotes(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	int clipIndex = args.value(QStringLiteral("clip_index")).toInt(-1);
+
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	if (clipIndex < 0 || clipIndex >= t->numOfClips())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip index %1 is out of range for track '%2'.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	Clip* c = t->getClip(clipIndex);
+	auto mc = dynamic_cast<MidiClip*>(c);
+	if (!mc)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip at index %1 on track '%2' is not a piano roll MidiClip.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	const auto& notesList = mc->notes();
+	QSet<Note*> toRemove;
+
+	if (args.contains(QStringLiteral("note_indices")))
+	{
+		QJsonArray indices = args.value(QStringLiteral("note_indices")).toArray();
+		for (const QJsonValue& iv : indices)
+		{
+			int idx = iv.toInt(-1);
+			if (idx >= 0 && idx < static_cast<int>(notesList.size()))
+			{
+				toRemove.insert(const_cast<Note*>(notesList[idx]));
+			}
+		}
+	}
+
+	int tpb = song->ticksPerBar();
+	if (args.contains(QStringLiteral("from_bar")) || args.contains(QStringLiteral("to_bar")))
+	{
+		int fromTick = static_cast<int>(std::round(args.value(QStringLiteral("from_bar")).toDouble(0.0) * tpb));
+		int toTick = static_cast<int>(std::round(args.value(QStringLiteral("to_bar")).toDouble(std::numeric_limits<double>::max()) * tpb));
+		for (Note* n : notesList)
+		{
+			if (n && n->pos().getTicks() >= fromTick && n->pos().getTicks() <= toTick)
+			{
+				toRemove.insert(n);
+			}
+		}
+	}
+
+	if (args.contains(QStringLiteral("min_key")) || args.contains(QStringLiteral("max_key")))
+	{
+		bool k1Ok = true, k2Ok = true;
+		int minK = args.contains(QStringLiteral("min_key")) ? parseKeyStringOrInt(args.value(QStringLiteral("min_key")), k1Ok) : 0;
+		int maxK = args.contains(QStringLiteral("max_key")) ? parseKeyStringOrInt(args.value(QStringLiteral("max_key")), k2Ok) : 127;
+		for (Note* n : notesList)
+		{
+			if (n && n->key() >= minK && n->key() <= maxK)
+			{
+				toRemove.insert(n);
+			}
+		}
+	}
+
+	int deletedCount = 0;
+	for (Note* n : toRemove)
+	{
+		mc->removeNote(n);
+		deletedCount++;
+	}
+
+	mc->rearrangeAllNotes();
+	mc->updateLength();
+	song->updateLength();
+	song->setModified();
+	emit mc->dataChanged();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Successfully deleted %1 notes from clip.").arg(deletedCount);
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("clip_index")] = clipIndex;
+	data[QStringLiteral("deleted_count")] = deletedCount;
+	data[QStringLiteral("remaining_notes")] = static_cast<int>(mc->notes().size());
+	return data;
+}
+
+static QJsonObject handleTransposeNotes(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	int clipIndex = args.value(QStringLiteral("clip_index")).toInt(-1);
+	int semitones = args.value(QStringLiteral("semitones")).toInt(0);
+
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	if (clipIndex < 0 || clipIndex >= t->numOfClips())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip index %1 is out of range for track '%2'.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	Clip* c = t->getClip(clipIndex);
+	auto mc = dynamic_cast<MidiClip*>(c);
+	if (!mc)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip at index %1 on track '%2' is not a piano roll MidiClip.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	const auto& notesList = mc->notes();
+	QSet<int> targetIndices;
+	if (args.contains(QStringLiteral("note_indices")))
+	{
+		QJsonArray arr = args.value(QStringLiteral("note_indices")).toArray();
+		for (const QJsonValue& v : arr) targetIndices.insert(v.toInt());
+	}
+
+	auto it = dynamic_cast<InstrumentTrack*>(t);
+	if (it) it->lock();
+
+	int transposedCount = 0;
+	for (size_t i = 0; i < notesList.size(); ++i)
+	{
+		if (!targetIndices.isEmpty() && !targetIndices.contains(static_cast<int>(i)))
+		{
+			continue;
+		}
+
+		Note* n = const_cast<Note*>(notesList[i]);
+		if (!n) continue;
+
+		int newKey = std::clamp(n->key() + semitones, 0, NumKeys - 1);
+		n->setKey(newKey);
+		transposedCount++;
+	}
+
+	if (it) it->unlock();
+
+	mc->rearrangeAllNotes();
+	song->setModified();
+	emit mc->dataChanged();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Transposed %1 notes by %2 semitones.")
+		.arg(transposedCount).arg(semitones >= 0 ? QStringLiteral("+%1").arg(semitones) : QString::number(semitones));
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("clip_index")] = clipIndex;
+	data[QStringLiteral("semitones")] = semitones;
+	data[QStringLiteral("transposed_count")] = transposedCount;
+	return data;
+}
+
+static int parseGridStringToTicks(const QString& gridStr, int ticksPerBar)
+{
+	QString s = gridStr.trimmed().toUpper();
+	int ticksPerBeat = ticksPerBar / 4;
+
+	if (s == QStringLiteral("1/1") || s == QStringLiteral("1 BAR")) return ticksPerBar;
+	if (s == QStringLiteral("1/2")) return ticksPerBar / 2;
+	if (s == QStringLiteral("1/4") || s == QStringLiteral("1 BEAT")) return ticksPerBeat;
+	if (s == QStringLiteral("1/8")) return ticksPerBeat / 2;
+	if (s == QStringLiteral("1/16") || s == QStringLiteral("1 STEP")) return ticksPerBeat / 4;
+	if (s == QStringLiteral("1/32")) return ticksPerBeat / 8;
+	if (s == QStringLiteral("1/64")) return ticksPerBeat / 16;
+	if (s == QStringLiteral("1/4T")) return (ticksPerBeat * 2) / 3;
+	if (s == QStringLiteral("1/8T")) return ticksPerBeat / 3;
+	if (s == QStringLiteral("1/16T")) return (ticksPerBeat / 2) / 3;
+	if (s == QStringLiteral("1/32T")) return (ticksPerBeat / 4) / 3;
+
+	bool isNum = false;
+	int numTicks = s.toInt(&isNum);
+	if (isNum && numTicks > 0) return numTicks;
+
+	return ticksPerBeat / 4;
+}
+
+static QJsonObject handleQuantizeNotes(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	int clipIndex = args.value(QStringLiteral("clip_index")).toInt(-1);
+
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	if (clipIndex < 0 || clipIndex >= t->numOfClips())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip index %1 is out of range for track '%2'.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	Clip* c = t->getClip(clipIndex);
+	auto mc = dynamic_cast<MidiClip*>(c);
+	if (!mc)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip at index %1 on track '%2' is not a piano roll MidiClip.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	QString gridStr = args.value(QStringLiteral("grid")).toString(QStringLiteral("1/16"));
+	int gridTicks = parseGridStringToTicks(gridStr, song->ticksPerBar());
+	bool quantizeLength = args.value(QStringLiteral("quantize_length")).toBool(false);
+
+	const auto& notesList = mc->notes();
+	QSet<int> targetIndices;
+	if (args.contains(QStringLiteral("note_indices")))
+	{
+		QJsonArray arr = args.value(QStringLiteral("note_indices")).toArray();
+		for (const QJsonValue& v : arr) targetIndices.insert(v.toInt());
+	}
+
+	auto it = dynamic_cast<InstrumentTrack*>(t);
+	if (it) it->lock();
+
+	int quantizedCount = 0;
+	for (size_t i = 0; i < notesList.size(); ++i)
+	{
+		if (!targetIndices.isEmpty() && !targetIndices.contains(static_cast<int>(i)))
+		{
+			continue;
+		}
+
+		Note* n = const_cast<Note*>(notesList[i]);
+		if (!n) continue;
+
+		n->quantizePos(gridTicks);
+		if (quantizeLength)
+		{
+			n->quantizeLength(gridTicks);
+		}
+		quantizedCount++;
+	}
+
+	if (it) it->unlock();
+
+	mc->rearrangeAllNotes();
+	mc->updateLength();
+	song->updateLength();
+	song->setModified();
+	emit mc->dataChanged();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Quantized %1 notes to %2 grid (%3 ticks).")
+		.arg(quantizedCount).arg(gridStr).arg(gridTicks);
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("clip_index")] = clipIndex;
+	data[QStringLiteral("grid")] = gridStr;
+	data[QStringLiteral("grid_ticks")] = gridTicks;
+	data[QStringLiteral("quantized_length")] = quantizeLength;
+	data[QStringLiteral("quantized_count")] = quantizedCount;
+	return data;
+}
+
+static QJsonObject handleHumanizeNotes(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	int clipIndex = args.value(QStringLiteral("clip_index")).toInt(-1);
+
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	if (clipIndex < 0 || clipIndex >= t->numOfClips())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip index %1 is out of range for track '%2'.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	Clip* c = t->getClip(clipIndex);
+	auto mc = dynamic_cast<MidiClip*>(c);
+	if (!mc)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip at index %1 on track '%2' is not a piano roll MidiClip.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	int timingRange = args.value(QStringLiteral("timing_range_ticks")).toInt(4);
+	int velocityRange = args.value(QStringLiteral("velocity_range")).toInt(8);
+
+	const auto& notesList = mc->notes();
+	QSet<int> targetIndices;
+	if (args.contains(QStringLiteral("note_indices")))
+	{
+		QJsonArray arr = args.value(QStringLiteral("note_indices")).toArray();
+		for (const QJsonValue& v : arr) targetIndices.insert(v.toInt());
+	}
+
+	auto it = dynamic_cast<InstrumentTrack*>(t);
+	if (it) it->lock();
+
+	std::mt19937 rng(std::random_device{}());
+	std::uniform_int_distribution<int> timeDist(-timingRange, timingRange);
+	std::uniform_int_distribution<int> velDist(-velocityRange, velocityRange);
+
+	int humanizedCount = 0;
+	for (size_t i = 0; i < notesList.size(); ++i)
+	{
+		if (!targetIndices.isEmpty() && !targetIndices.contains(static_cast<int>(i)))
+		{
+			continue;
+		}
+
+		Note* n = const_cast<Note*>(notesList[i]);
+		if (!n) continue;
+
+		if (timingRange > 0)
+		{
+			int newPos = std::max(0, static_cast<int>(n->pos().getTicks()) + timeDist(rng));
+			n->setPos(TimePos(newPos));
+		}
+
+		if (velocityRange > 0)
+		{
+			int newVol = std::clamp(static_cast<int>(n->getVolume()) + velDist(rng), 0, 200);
+			n->setVolume(static_cast<volume_t>(newVol));
+		}
+
+		humanizedCount++;
+	}
+
+	if (it) it->unlock();
+
+	mc->rearrangeAllNotes();
+	mc->updateLength();
+	song->updateLength();
+	song->setModified();
+	emit mc->dataChanged();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Humanized %1 notes (timing range +/- %2 ticks, velocity range +/- %3).")
+		.arg(humanizedCount).arg(timingRange).arg(velocityRange);
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("clip_index")] = clipIndex;
+	data[QStringLiteral("humanized_count")] = humanizedCount;
+	return data;
+}
+
+static QJsonObject handleControlSampleClip(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	int clipIndex = args.value(QStringLiteral("clip_index")).toInt(-1);
+
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	if (clipIndex < 0 || clipIndex >= t->numOfClips())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip index %1 is out of range for track '%2'.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	Clip* c = t->getClip(clipIndex);
+	auto sc = dynamic_cast<SampleClip*>(c);
+	if (!sc)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip at index %1 on track '%2' is not a SampleClip.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	if (args.contains(QStringLiteral("reversed")))
+	{
+		sc->sample().setReversed(args.value(QStringLiteral("reversed")).toBool());
+	}
+
+	float currentFreq = sc->sample().frequency();
+	float targetFreq = currentFreq;
+
+	if (args.contains(QStringLiteral("pitch_shift_semitones")))
+	{
+		double semitones = args.value(QStringLiteral("pitch_shift_semitones")).toDouble(0.0);
+		targetFreq = DefaultBaseFreq * static_cast<float>(std::pow(2.0, semitones / 12.0));
+	}
+
+	if (args.contains(QStringLiteral("playback_rate")))
+	{
+		double rate = args.value(QStringLiteral("playback_rate")).toDouble(1.0);
+		if (rate > 0.01)
+		{
+			targetFreq *= static_cast<float>(rate);
+		}
+	}
+
+	if (targetFreq != currentFreq)
+	{
+		sc->sample().setFrequency(targetFreq);
+	}
+
+	sc->updateLength();
+	song->updateLength();
+	song->setModified();
+	emit sc->dataChanged();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("SampleClip playback properties updated.");
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("clip_index")] = clipIndex;
+	data[QStringLiteral("reversed")] = sc->sample().reversed();
+	data[QStringLiteral("frequency")] = sc->sample().frequency();
+	data[QStringLiteral("pitch_ratio")] = sc->sample().frequency() / DefaultBaseFreq;
+	return data;
+}
+
+static QJsonObject handleGetSampleInfo(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	QString path = args.value(QStringLiteral("sample_path")).toString().trimmed();
+	if (path.isEmpty())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Missing required parameter: 'sample_path'.");
+		return QJsonObject();
+	}
+
+	QFileInfo fi(path);
+	if (!fi.exists())
+	{
+		QString userSampleDir = ConfigManager::inst()->userSamplesDir();
+		QString testPath = userSampleDir + QLatin1Char('/') + path;
+		if (QFileInfo::exists(testPath))
+		{
+			path = testPath;
+			fi = QFileInfo(path);
+		}
+	}
+
+	if (!fi.exists())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Sample file does not exist: '%1'.").arg(path);
+		return QJsonObject();
+	}
+
+	auto sb = SampleBuffer::fromFile(path);
+	if (!sb || sb->empty())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Failed to decode audio data from sample: '%1'.").arg(path);
+		return QJsonObject();
+	}
+
+	sample_rate_t sr = sb->sampleRate();
+	size_t totalFrames = sb->size();
+	double durationSec = sr > 0 ? static_cast<double>(totalFrames) / sr : 0.0;
+
+	Song* song = Engine::getSong();
+	double durationBars = 0.0;
+	if (song && song->getTempo() > 0)
+	{
+		double beats = (durationSec / 60.0) * song->getTempo();
+		int num = song->getTimeSigModel().getNumerator();
+		durationBars = num > 0 ? (beats / num) : (beats / 4.0);
+	}
+
+	float maxPeak = 0.0f;
+	const SampleFrame* data = sb->data();
+	for (size_t i = 0; i < totalFrames; ++i)
+	{
+		float left = std::abs(data[i][0]);
+		float right = std::abs(data[i][1]);
+		if (left > maxPeak) maxPeak = left;
+		if (right > maxPeak) maxPeak = right;
+	}
+
+	ok = true;
+	QJsonObject res;
+	res[QStringLiteral("file_path")] = path;
+	res[QStringLiteral("file_name")] = fi.fileName();
+	res[QStringLiteral("file_size_bytes")] = static_cast<qint64>(fi.size());
+	res[QStringLiteral("sample_rate")] = static_cast<int>(sr);
+	res[QStringLiteral("channels")] = 2;
+	res[QStringLiteral("frames")] = static_cast<qint64>(totalFrames);
+	res[QStringLiteral("duration_seconds")] = durationSec;
+	res[QStringLiteral("duration_bars")] = durationBars;
+	res[QStringLiteral("waveform_peak")] = maxPeak;
+	res[QStringLiteral("waveform_peak_db")] = maxPeak > 0.00001f ? 20.0f * std::log10(maxPeak) : -100.0f;
+	return res;
+}
+
+static QJsonObject handlePlaceBBClip(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	PatternTrack* pt = nullptr;
+	int patternIndex = -1;
+
+	if (args.contains(QStringLiteral("bb_track_index")))
+	{
+		int idx = args.value(QStringLiteral("bb_track_index")).toInt(-1);
+		if (idx >= 0 && idx < static_cast<int>(song->tracks().size()))
+		{
+			pt = dynamic_cast<PatternTrack*>(song->tracks()[idx]);
+			if (pt) patternIndex = pt->patternIndex();
+		}
+		if (!pt && idx >= 0)
+		{
+			pt = PatternTrack::findPatternTrack(idx);
+			if (pt) patternIndex = idx;
+		}
+	}
+	else if (args.contains(QStringLiteral("pattern_index")))
+	{
+		patternIndex = args.value(QStringLiteral("pattern_index")).toInt(0);
+		pt = PatternTrack::findPatternTrack(patternIndex);
+	}
+
+	if (!pt)
+	{
+		for (Track* t : song->tracks())
+		{
+			if (auto candidate = dynamic_cast<PatternTrack*>(t))
+			{
+				pt = candidate;
+				patternIndex = pt->patternIndex();
+				break;
+			}
+		}
+	}
+
+	if (!pt)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("No PatternTrack found on Song timeline.");
+		return QJsonObject();
+	}
+
+	double startBar = args.value(QStringLiteral("start_bar")).toDouble(0.0);
+	double lengthBars = args.value(QStringLiteral("length_bars")).toDouble(1.0);
+	int tpb = song->ticksPerBar();
+
+	TimePos pos(static_cast<tick_t>(std::round(startBar * tpb)));
+	Clip* c = pt->createClip(pos);
+	if (!c)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Failed to create pattern container clip on track '%1'.").arg(pt->name());
+		return QJsonObject();
+	}
+
+	if (lengthBars > 0.0)
+	{
+		c->changeLength(TimePos(static_cast<tick_t>(std::round(lengthBars * tpb))));
+	}
+
+	c->updateLength();
+	song->updateLength();
+	song->setModified();
+	emit c->dataChanged();
+	emit pt->dataChanged();
+
+	int newClipIdx = pt->numOfClips() - 1;
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Placed Beat+Bassline pattern '%1' on Song timeline at bar %2.")
+		.arg(pt->name()).arg(startBar);
+	data[QStringLiteral("pattern_index")] = patternIndex;
+	data[QStringLiteral("pattern_name")] = pt->name();
+	data[QStringLiteral("start_bar")] = startBar;
+	data[QStringLiteral("length_bars")] = lengthBars;
+	data[QStringLiteral("clip_index")] = newClipIdx;
+	return data;
+}
+
+static QJsonObject handleGetBBPattern(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	PatternStore* ps = Engine::patternStore();
+	if (!ps)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("PatternStore is not available.");
+		return QJsonObject();
+	}
+
+	int patternIndex = args.value(QStringLiteral("pattern_index")).toInt(0);
+	int targetTrack = args.value(QStringLiteral("track_index")).toInt(-1);
+
+	const auto& tracks = ps->tracks();
+	QJsonArray tracksArray;
+
+	for (size_t i = 0; i < tracks.size(); ++i)
+	{
+		Track* t = tracks[i];
+		if (!t) continue;
+		if (targetTrack >= 0 && static_cast<int>(i) != targetTrack) continue;
+
+		auto it = dynamic_cast<InstrumentTrack*>(t);
+		if (!it) continue;
+
+		Clip* c = it->getClip(patternIndex);
+		auto mc = dynamic_cast<MidiClip*>(c);
+
+		QJsonArray stepsArray;
+		QString patternStr;
+		int activeCount = 0;
+
+		int numSteps = 16;
+		if (mc)
+		{
+			for (int s = 0; s < numSteps; ++s)
+			{
+				Note* n = mc->noteAtStep(s);
+				bool active = (n != nullptr);
+				stepsArray.append(active);
+				patternStr.append(active ? QLatin1Char('x') : QLatin1Char('.'));
+				if (active) activeCount++;
+			}
+		}
+
+		QJsonObject tObj;
+		tObj[QStringLiteral("track_index")] = static_cast<int>(i);
+		tObj[QStringLiteral("track_name")] = it->name();
+		tObj[QStringLiteral("active_steps_count")] = activeCount;
+		tObj[QStringLiteral("pattern_string")] = patternStr;
+		tObj[QStringLiteral("steps")] = stepsArray;
+		tracksArray.append(tObj);
+	}
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("pattern_index")] = patternIndex;
+	data[QStringLiteral("track_count")] = tracksArray.size();
+	data[QStringLiteral("tracks")] = tracksArray;
+	return data;
+}
+
+static QJsonObject handleGetAutomationData(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	int clipIndex = args.value(QStringLiteral("clip_index")).toInt(-1);
+
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	auto at = dynamic_cast<AutomationTrack*>(t);
+	if (!at)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track '%1' is not an AutomationTrack.").arg(t->name());
+		return QJsonObject();
+	}
+
+	if (clipIndex < 0 || clipIndex >= at->numOfClips())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip index %1 is out of range for track '%2'.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	Clip* c = at->getClip(clipIndex);
+	auto ac = dynamic_cast<AutomationClip*>(c);
+	if (!ac)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip at index %1 on track '%2' is not an AutomationClip.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	QString progType;
+	switch (ac->progressionType())
+	{
+		case AutomationClip::ProgressionType::Discrete: progType = QStringLiteral("discrete"); break;
+		case AutomationClip::ProgressionType::CubicHermite: progType = QStringLiteral("cubic"); break;
+		default: progType = QStringLiteral("linear"); break;
+	}
+
+	int tpb = song->ticksPerBar();
+	const auto& timeMap = ac->getTimeMap();
+
+	QJsonArray nodesArr;
+	int idx = 0;
+	for (auto itMap = timeMap.cbegin(); itMap != timeMap.cend(); ++itMap)
+	{
+		int tick = itMap.key();
+		const AutomationNode& node = itMap.value();
+
+		QJsonObject no;
+		no[QStringLiteral("node_index")] = idx++;
+		no[QStringLiteral("tick")] = tick;
+		no[QStringLiteral("bar")] = static_cast<double>(tick) / tpb;
+		no[QStringLiteral("in_value")] = node.getInValue();
+		no[QStringLiteral("out_value")] = node.getOutValue();
+		no[QStringLiteral("in_tangent")] = node.getInTangent();
+		no[QStringLiteral("out_tangent")] = node.getOutTangent();
+		nodesArr.append(no);
+	}
+
+	QJsonArray linkedObjs;
+	for (const auto& ptr : ac->objects())
+	{
+		if (ptr)
+		{
+			QJsonObject lo;
+			lo[QStringLiteral("name")] = ptr->displayName();
+			lo[QStringLiteral("object_name")] = ptr->objectName();
+			lo[QStringLiteral("value")] = ptr->value<float>();
+			linkedObjs.append(lo);
+		}
+	}
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("clip_index")] = clipIndex;
+	data[QStringLiteral("progression_type")] = progType;
+	data[QStringLiteral("tension")] = ac->getTension();
+	data[QStringLiteral("nodes_count")] = nodesArr.size();
+	data[QStringLiteral("nodes")] = nodesArr;
+	data[QStringLiteral("linked_targets")] = linkedObjs;
+	return data;
+}
+
+static QJsonObject handleClearAutomationNodes(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Song* song = Engine::getSong();
+	if (!song)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("LMMS Song engine is not available.");
+		return QJsonObject();
+	}
+
+	int trackIndex = args.value(QStringLiteral("track_index")).toInt(-1);
+	int clipIndex = args.value(QStringLiteral("clip_index")).toInt(-1);
+
+	if (trackIndex < 0 || trackIndex >= static_cast<int>(song->tracks().size()))
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track index %1 is out of range.").arg(trackIndex);
+		return QJsonObject();
+	}
+
+	Track* t = song->tracks()[trackIndex];
+	auto at = dynamic_cast<AutomationTrack*>(t);
+	if (!at)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Track '%1' is not an AutomationTrack.").arg(t->name());
+		return QJsonObject();
+	}
+
+	if (clipIndex < 0 || clipIndex >= at->numOfClips())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip index %1 is out of range for track '%2'.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	Clip* c = at->getClip(clipIndex);
+	auto ac = dynamic_cast<AutomationClip*>(c);
+	if (!ac)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Clip at index %1 on track '%2' is not an AutomationClip.").arg(clipIndex).arg(t->name());
+		return QJsonObject();
+	}
+
+	int removedCount = 0;
+	if (args.contains(QStringLiteral("node_index")))
+	{
+		int targetNodeIdx = args.value(QStringLiteral("node_index")).toInt(-1);
+		const auto& timeMap = ac->getTimeMap();
+		if (targetNodeIdx >= 0 && targetNodeIdx < timeMap.size())
+		{
+			auto itMap = timeMap.cbegin();
+			std::advance(itMap, targetNodeIdx);
+			ac->removeNode(TimePos(itMap.key()));
+			removedCount = 1;
+		}
+	}
+	else
+	{
+		removedCount = ac->getTimeMap().size();
+		ac->removeNodes(0, std::numeric_limits<int>::max());
+	}
+
+	ac->updateLength();
+	song->updateLength();
+	song->setModified();
+	emit ac->dataChanged();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Removed %1 automation nodes.").arg(removedCount);
+	data[QStringLiteral("track_index")] = trackIndex;
+	data[QStringLiteral("clip_index")] = clipIndex;
+	data[QStringLiteral("removed_count")] = removedCount;
+	data[QStringLiteral("remaining_nodes")] = ac->getTimeMap().size();
+	return data;
+}
+
 void registerTrackTools(AgentToolRegistry& reg)
 {
 	// 1. add_sample_clip
@@ -1591,7 +2745,10 @@ void registerTrackTools(AgentToolRegistry& reg)
 		QJsonObject propName;
 		propName[QStringLiteral("type")] = QStringLiteral("string");
 		propName[QStringLiteral("description")] = QStringLiteral("Optional custom name for the new track (e.g. 'Bassline', 'Lead Synth', 'Drums').");
-		props[QStringLiteral("name")] = propName;
+		QJsonObject propInBB;
+		propInBB[QStringLiteral("type")] = QStringLiteral("boolean");
+		propInBB[QStringLiteral("description")] = QStringLiteral("If true, creates the track inside the Beat+Bassline (Pattern) editor rather than the Song editor.");
+		props[QStringLiteral("in_bb_editor")] = propInBB;
 
 		QJsonArray required;
 		required.append(QStringLiteral("type"));
@@ -1963,6 +3120,431 @@ void registerTrackTools(AgentToolRegistry& reg)
 			props,
 			req,
 			handleControlTrack
+		);
+	}
+
+	// 15. modify_notes
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the instrument track holding the clip.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propClip;
+		propClip[QStringLiteral("type")] = QStringLiteral("integer");
+		propClip[QStringLiteral("description")] = QStringLiteral("Index of the clip on the track.");
+		props[QStringLiteral("clip_index")] = propClip;
+
+		QJsonObject propEdits;
+		propEdits[QStringLiteral("type")] = QStringLiteral("array");
+		propEdits[QStringLiteral("description")] = QStringLiteral("Array of edit objects: [{'note_index': 0, 'key': 'F#4', 'volume': 110, 'pos_beat': 0.5, 'len_beat': 1.0}].");
+		props[QStringLiteral("edits")] = propEdits;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+		req.append(QStringLiteral("clip_index"));
+		req.append(QStringLiteral("edits"));
+
+		reg.registerTool(
+			QStringLiteral("modify_notes"),
+			QStringLiteral("Mutates specific notes in-place by index without clearing or rebuilding the clip."),
+			props,
+			req,
+			handleModifyNotes
+		);
+	}
+
+	// 16. replace_notes_in_range
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the instrument track.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propClip;
+		propClip[QStringLiteral("type")] = QStringLiteral("integer");
+		propClip[QStringLiteral("description")] = QStringLiteral("Index of the clip on the track.");
+		props[QStringLiteral("clip_index")] = propClip;
+
+		QJsonObject propFrom;
+		propFrom[QStringLiteral("type")] = QStringLiteral("number");
+		propFrom[QStringLiteral("description")] = QStringLiteral("Start bar position (inclusive).");
+		props[QStringLiteral("from_bar")] = propFrom;
+
+		QJsonObject propTo;
+		propTo[QStringLiteral("type")] = QStringLiteral("number");
+		propTo[QStringLiteral("description")] = QStringLiteral("End bar position (exclusive).");
+		props[QStringLiteral("to_bar")] = propTo;
+
+		QJsonObject propNotes;
+		propNotes[QStringLiteral("type")] = QStringLiteral("array");
+		propNotes[QStringLiteral("description")] = QStringLiteral("Array of replacement note objects.");
+		props[QStringLiteral("new_notes")] = propNotes;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+		req.append(QStringLiteral("clip_index"));
+		req.append(QStringLiteral("from_bar"));
+		req.append(QStringLiteral("to_bar"));
+		req.append(QStringLiteral("new_notes"));
+
+		reg.registerTool(
+			QStringLiteral("replace_notes_in_range"),
+			QStringLiteral("Replaces only notes occurring between two timeline bar points, leaving preceding and following bars untouched."),
+			props,
+			req,
+			handleReplaceNotesInRange
+		);
+	}
+
+	// 17. delete_notes
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the track.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propClip;
+		propClip[QStringLiteral("type")] = QStringLiteral("integer");
+		propClip[QStringLiteral("description")] = QStringLiteral("Index of the clip.");
+		props[QStringLiteral("clip_index")] = propClip;
+
+		QJsonObject propIdxs;
+		propIdxs[QStringLiteral("type")] = QStringLiteral("array");
+		propIdxs[QStringLiteral("description")] = QStringLiteral("Optional array of note indices to delete.");
+		props[QStringLiteral("note_indices")] = propIdxs;
+
+		QJsonObject propFrom;
+		propFrom[QStringLiteral("type")] = QStringLiteral("number");
+		propFrom[QStringLiteral("description")] = QStringLiteral("Optional timeline start bar filter.");
+		props[QStringLiteral("from_bar")] = propFrom;
+
+		QJsonObject propTo;
+		propTo[QStringLiteral("type")] = QStringLiteral("number");
+		propTo[QStringLiteral("description")] = QStringLiteral("Optional timeline end bar filter.");
+		props[QStringLiteral("to_bar")] = propTo;
+
+		QJsonObject propMinKey;
+		propMinKey[QStringLiteral("description")] = QStringLiteral("Optional minimum key/pitch filter (e.g. 'C3' or 48).");
+		props[QStringLiteral("min_key")] = propMinKey;
+
+		QJsonObject propMaxKey;
+		propMaxKey[QStringLiteral("description")] = QStringLiteral("Optional maximum key/pitch filter (e.g. 'B4' or 71).");
+		props[QStringLiteral("max_key")] = propMaxKey;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+		req.append(QStringLiteral("clip_index"));
+
+		reg.registerTool(
+			QStringLiteral("delete_notes"),
+			QStringLiteral("Removes individual notes from a clip by their indices or within pitch/time ranges."),
+			props,
+			req,
+			handleDeleteNotes
+		);
+	}
+
+	// 18. transpose_notes
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the track.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propClip;
+		propClip[QStringLiteral("type")] = QStringLiteral("integer");
+		propClip[QStringLiteral("description")] = QStringLiteral("Index of the clip.");
+		props[QStringLiteral("clip_index")] = propClip;
+
+		QJsonObject propSemi;
+		propSemi[QStringLiteral("type")] = QStringLiteral("integer");
+		propSemi[QStringLiteral("description")] = QStringLiteral("Semitones offset to transpose (e.g. +2, -12).");
+		props[QStringLiteral("semitones")] = propSemi;
+
+		QJsonObject propIdxs;
+		propIdxs[QStringLiteral("type")] = QStringLiteral("array");
+		propIdxs[QStringLiteral("description")] = QStringLiteral("Optional array of specific note indices to transpose. If omitted, transposes all notes.");
+		props[QStringLiteral("note_indices")] = propIdxs;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+		req.append(QStringLiteral("clip_index"));
+		req.append(QStringLiteral("semitones"));
+
+		reg.registerTool(
+			QStringLiteral("transpose_notes"),
+			QStringLiteral("Transposes an entire clip or note selection up or down by a semitone offset."),
+			props,
+			req,
+			handleTransposeNotes
+		);
+	}
+
+	// 19. quantize_notes
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the track.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propClip;
+		propClip[QStringLiteral("type")] = QStringLiteral("integer");
+		propClip[QStringLiteral("description")] = QStringLiteral("Index of the clip.");
+		props[QStringLiteral("clip_index")] = propClip;
+
+		QJsonObject propGrid;
+		propGrid[QStringLiteral("type")] = QStringLiteral("string");
+		propGrid[QStringLiteral("description")] = QStringLiteral("Rhythmic quantize grid: '1/16', '1/8', '1/32', '1/4', '1/8T', etc. (default: '1/16').");
+		props[QStringLiteral("grid")] = propGrid;
+
+		QJsonObject propQLen;
+		propQLen[QStringLiteral("type")] = QStringLiteral("boolean");
+		propQLen[QStringLiteral("description")] = QStringLiteral("If true, also snaps note lengths/durations to the grid (default: false).");
+		props[QStringLiteral("quantize_length")] = propQLen;
+
+		QJsonObject propIdxs;
+		propIdxs[QStringLiteral("type")] = QStringLiteral("array");
+		propIdxs[QStringLiteral("description")] = QStringLiteral("Optional array of specific note indices to quantize.");
+		props[QStringLiteral("note_indices")] = propIdxs;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+		req.append(QStringLiteral("clip_index"));
+
+		reg.registerTool(
+			QStringLiteral("quantize_notes"),
+			QStringLiteral("Snaps note start times and/or durations tightly to a musical rhythmic grid."),
+			props,
+			req,
+			handleQuantizeNotes
+		);
+	}
+
+	// 20. humanize_notes
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the track.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propClip;
+		propClip[QStringLiteral("type")] = QStringLiteral("integer");
+		propClip[QStringLiteral("description")] = QStringLiteral("Index of the clip.");
+		props[QStringLiteral("clip_index")] = propClip;
+
+		QJsonObject propTiming;
+		propTiming[QStringLiteral("type")] = QStringLiteral("integer");
+		propTiming[QStringLiteral("description")] = QStringLiteral("Maximum timing offset range in ticks (+/- ticks, default: 4).");
+		props[QStringLiteral("timing_range_ticks")] = propTiming;
+
+		QJsonObject propVel;
+		propVel[QStringLiteral("type")] = QStringLiteral("integer");
+		propVel[QStringLiteral("description")] = QStringLiteral("Maximum velocity offset range (+/-, default: 8).");
+		props[QStringLiteral("velocity_range")] = propVel;
+
+		QJsonObject propIdxs;
+		propIdxs[QStringLiteral("type")] = QStringLiteral("array");
+		propIdxs[QStringLiteral("description")] = QStringLiteral("Optional array of specific note indices to humanize.");
+		props[QStringLiteral("note_indices")] = propIdxs;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+		req.append(QStringLiteral("clip_index"));
+
+		reg.registerTool(
+			QStringLiteral("humanize_notes"),
+			QStringLiteral("Applies subtle randomized timing offsets (micro-timing) and velocity variation for organic human feel."),
+			props,
+			req,
+			handleHumanizeNotes
+		);
+	}
+
+	// 21. control_sample_clip
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the SampleTrack.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propClip;
+		propClip[QStringLiteral("type")] = QStringLiteral("integer");
+		propClip[QStringLiteral("description")] = QStringLiteral("Index of the SampleClip on the track.");
+		props[QStringLiteral("clip_index")] = propClip;
+
+		QJsonObject propRev;
+		propRev[QStringLiteral("type")] = QStringLiteral("boolean");
+		propRev[QStringLiteral("description")] = QStringLiteral("Play sample in reverse.");
+		props[QStringLiteral("reversed")] = propRev;
+
+		QJsonObject propPitch;
+		propPitch[QStringLiteral("type")] = QStringLiteral("number");
+		propPitch[QStringLiteral("description")] = QStringLiteral("Pitch shift in semitones (e.g. -12.0 for octave down, +7.0 for fifth up).");
+		props[QStringLiteral("pitch_shift_semitones")] = propPitch;
+
+		QJsonObject propRate;
+		propRate[QStringLiteral("type")] = QStringLiteral("number");
+		propRate[QStringLiteral("description")] = QStringLiteral("Playback rate multiplier (e.g. 0.5 for half speed, 2.0 for double speed).");
+		props[QStringLiteral("playback_rate")] = propRate;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+		req.append(QStringLiteral("clip_index"));
+
+		reg.registerTool(
+			QStringLiteral("control_sample_clip"),
+			QStringLiteral("Adjusts playback properties of an audio sample clip on the timeline (reverse, pitch-shift, playback rate)."),
+			props,
+			req,
+			handleControlSampleClip
+		);
+	}
+
+	// 22. get_sample_info
+	{
+		QJsonObject props;
+		QJsonObject propPath;
+		propPath[QStringLiteral("type")] = QStringLiteral("string");
+		propPath[QStringLiteral("description")] = QStringLiteral("Path to audio file on disk.");
+		props[QStringLiteral("sample_path")] = propPath;
+
+		QJsonArray req;
+		req.append(QStringLiteral("sample_path"));
+
+		reg.registerTool(
+			QStringLiteral("get_sample_info"),
+			QStringLiteral("Reads audio file metadata directly from disk (sample rate, channels, frames, duration in seconds/bars, waveform peak)."),
+			props,
+			req,
+			handleGetSampleInfo
+		);
+	}
+
+	// 23. place_bb_clip
+	{
+		QJsonObject props;
+		QJsonObject propBBTrack;
+		propBBTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propBBTrack[QStringLiteral("description")] = QStringLiteral("Track index of the PatternTrack on the timeline, or Beat+Bassline pattern index.");
+		props[QStringLiteral("bb_track_index")] = propBBTrack;
+
+		QJsonObject propPattern;
+		propPattern[QStringLiteral("type")] = QStringLiteral("integer");
+		propPattern[QStringLiteral("description")] = QStringLiteral("Pattern index (0-indexed, default: 0).");
+		props[QStringLiteral("pattern_index")] = propPattern;
+
+		QJsonObject propStartBar;
+		propStartBar[QStringLiteral("type")] = QStringLiteral("number");
+		propStartBar[QStringLiteral("description")] = QStringLiteral("Song timeline start position in bars.");
+		props[QStringLiteral("start_bar")] = propStartBar;
+
+		QJsonObject propLenBars;
+		propLenBars[QStringLiteral("type")] = QStringLiteral("number");
+		propLenBars[QStringLiteral("description")] = QStringLiteral("Length in bars for the pattern container clip on the timeline (default: 1.0).");
+		props[QStringLiteral("length_bars")] = propLenBars;
+
+		QJsonArray req;
+		req.append(QStringLiteral("start_bar"));
+
+		reg.registerTool(
+			QStringLiteral("place_bb_clip"),
+			QStringLiteral("Places a Beat+Bassline pattern container onto the Song timeline at an exact bar."),
+			props,
+			req,
+			handlePlaceBBClip
+		);
+	}
+
+	// 24. get_bb_pattern
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Optional track index in Beat+Bassline editor. If omitted, returns all tracks.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propPattern;
+		propPattern[QStringLiteral("type")] = QStringLiteral("integer");
+		propPattern[QStringLiteral("description")] = QStringLiteral("Pattern index (default: 0).");
+		props[QStringLiteral("pattern_index")] = propPattern;
+
+		reg.registerTool(
+			QStringLiteral("get_bb_pattern"),
+			QStringLiteral("Reads back the active 16/32 step states of instruments in a Beat+Bassline pattern."),
+			props,
+			QJsonArray(),
+			handleGetBBPattern
+		);
+	}
+
+	// 25. get_automation_data
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the AutomationTrack.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propClip;
+		propClip[QStringLiteral("type")] = QStringLiteral("integer");
+		propClip[QStringLiteral("description")] = QStringLiteral("Index of the automation clip (default: 0).");
+		props[QStringLiteral("clip_index")] = propClip;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+
+		reg.registerTool(
+			QStringLiteral("get_automation_data"),
+			QStringLiteral("Reads all node points, time positions, values (0.0-1.0), curve progression, and tension inside an automation clip."),
+			props,
+			req,
+			handleGetAutomationData
+		);
+	}
+
+	// 26. clear_automation_nodes / delete_automation_node
+	{
+		QJsonObject props;
+		QJsonObject propTrack;
+		propTrack[QStringLiteral("type")] = QStringLiteral("integer");
+		propTrack[QStringLiteral("description")] = QStringLiteral("Index of the AutomationTrack.");
+		props[QStringLiteral("track_index")] = propTrack;
+
+		QJsonObject propClip;
+		propClip[QStringLiteral("type")] = QStringLiteral("integer");
+		propClip[QStringLiteral("description")] = QStringLiteral("Index of the automation clip (default: 0).");
+		props[QStringLiteral("clip_index")] = propClip;
+
+		QJsonObject propNodeIdx;
+		propNodeIdx[QStringLiteral("type")] = QStringLiteral("integer");
+		propNodeIdx[QStringLiteral("description")] = QStringLiteral("Optional index of a specific node to delete. If omitted, removes all nodes.");
+		props[QStringLiteral("node_index")] = propNodeIdx;
+
+		QJsonArray req;
+		req.append(QStringLiteral("track_index"));
+
+		reg.registerTool(
+			QStringLiteral("clear_automation_nodes"),
+			QStringLiteral("Removes all nodes or an individual node from an automation clip."),
+			props,
+			req,
+			handleClearAutomationNodes
+		);
+
+		reg.registerTool(
+			QStringLiteral("delete_automation_node"),
+			QStringLiteral("Removes an individual node or all nodes from an automation clip."),
+			props,
+			req,
+			handleClearAutomationNodes
 		);
 	}
 }

@@ -30,6 +30,7 @@
 
 #include <QSet>
 #include <algorithm>
+#include <cmath>
 
 namespace lmms
 {
@@ -679,6 +680,170 @@ static QJsonObject handleGetMixerInfo(const QJsonObject& args, bool& ok, QString
 	return data;
 }
 
+static QJsonObject handleGetMixerPeakLevels(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Q_UNUSED(args);
+	Mixer* mixer = Engine::mixer();
+	if (!mixer)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Mixer engine is not available.");
+		return QJsonObject();
+	}
+
+	int numChannels = mixer->numChannels();
+	QJsonArray channelsArr;
+	bool masterClipping = false;
+
+	for (int i = 0; i < numChannels; ++i)
+	{
+		MixerChannel* ch = mixer->mixerChannel(i);
+		if (!ch) continue;
+
+		float leftPeak = ch->m_peakLeft;
+		float rightPeak = ch->m_peakRight;
+		float maxPeak = std::max(leftPeak, rightPeak);
+		bool clipping = (maxPeak >= 1.0f);
+
+		if (i == 0 && clipping)
+		{
+			masterClipping = true;
+		}
+
+		float peakDb = maxPeak > 0.00001f ? 20.0f * std::log10(maxPeak) : -100.0f;
+		float leftDb = leftPeak > 0.00001f ? 20.0f * std::log10(leftPeak) : -100.0f;
+		float rightDb = rightPeak > 0.00001f ? 20.0f * std::log10(rightPeak) : -100.0f;
+
+		QJsonObject chObj;
+		chObj[QStringLiteral("channel_index")] = i;
+		chObj[QStringLiteral("channel_name")] = (i == 0) ? QStringLiteral("Master") : (ch->m_name.isEmpty() ? QStringLiteral("FX %1").arg(i) : ch->m_name);
+		chObj[QStringLiteral("peak_linear")] = maxPeak;
+		chObj[QStringLiteral("peak_db")] = peakDb;
+		chObj[QStringLiteral("peak_left_linear")] = leftPeak;
+		chObj[QStringLiteral("peak_left_db")] = leftDb;
+		chObj[QStringLiteral("peak_right_linear")] = rightPeak;
+		chObj[QStringLiteral("peak_right_db")] = rightDb;
+		chObj[QStringLiteral("clipping")] = clipping;
+		chObj[QStringLiteral("muted")] = ch->m_muted;
+		channelsArr.append(chObj);
+	}
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("channel_count")] = numChannels;
+	data[QStringLiteral("master_clipping")] = masterClipping;
+	data[QStringLiteral("channels")] = channelsArr;
+	return data;
+}
+
+static QJsonObject handleReorderMixerEffects(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Mixer* mixer = Engine::mixer();
+	if (!mixer)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Mixer engine is not available.");
+		return QJsonObject();
+	}
+
+	int channelIndex = args.value(QStringLiteral("channel_index")).toInt(-1);
+	int fromIndex = args.value(QStringLiteral("from_index")).toInt(-1);
+	int toIndex = args.value(QStringLiteral("to_index")).toInt(-1);
+
+	if (channelIndex < 0 || channelIndex >= mixer->numChannels())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Channel index %1 is out of range.").arg(channelIndex);
+		return QJsonObject();
+	}
+
+	MixerChannel* ch = mixer->mixerChannel(channelIndex);
+	int numEffects = ch->m_fxChain.numOfEffects();
+
+	if (fromIndex < 0 || fromIndex >= numEffects)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("from_index %1 is out of range (channel has %2 effects).").arg(fromIndex).arg(numEffects);
+		return QJsonObject();
+	}
+
+	if (toIndex < 0 || toIndex >= numEffects)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("to_index %1 is out of range (channel has %2 effects).").arg(toIndex).arg(numEffects);
+		return QJsonObject();
+	}
+
+	Effect* targetEffect = ch->m_fxChain.effect(fromIndex);
+	if (!targetEffect)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("No effect found at index %1.").arg(fromIndex);
+		return QJsonObject();
+	}
+
+	int current = fromIndex;
+	while (current < toIndex)
+	{
+		ch->m_fxChain.moveDown(targetEffect);
+		current++;
+	}
+	while (current > toIndex)
+	{
+		ch->m_fxChain.moveUp(targetEffect);
+		current--;
+	}
+
+	syncMixerGUI();
+	if (Engine::getSong()) Engine::getSong()->setModified();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Moved effect '%1' from position %2 to %3 in channel %4.")
+		.arg(targetEffect->displayName()).arg(fromIndex).arg(toIndex).arg(channelIndex);
+	data[QStringLiteral("channel_index")] = channelIndex;
+	data[QStringLiteral("from_index")] = fromIndex;
+	data[QStringLiteral("to_index")] = toIndex;
+	data[QStringLiteral("effect_name")] = targetEffect->displayName();
+	return data;
+}
+
+static QJsonObject handleDeleteMixerChannel(const QJsonObject& args, bool& ok, QString& errorMsg)
+{
+	Mixer* mixer = Engine::mixer();
+	if (!mixer)
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Mixer engine is not available.");
+		return QJsonObject();
+	}
+
+	int channelIndex = args.value(QStringLiteral("channel_index")).toInt(-1);
+	if (channelIndex <= 0 || channelIndex >= mixer->numChannels())
+	{
+		ok = false;
+		errorMsg = QStringLiteral("Channel index %1 is invalid (cannot delete Master channel 0, must be between 1 and %2).")
+			.arg(channelIndex).arg(mixer->numChannels() - 1);
+		return QJsonObject();
+	}
+
+	MixerChannel* ch = mixer->mixerChannel(channelIndex);
+	QString chName = ch ? ch->m_name : QString::number(channelIndex);
+
+	mixer->deleteChannel(channelIndex);
+
+	syncMixerGUI();
+	if (Engine::getSong()) Engine::getSong()->setModified();
+
+	ok = true;
+	QJsonObject data;
+	data[QStringLiteral("message")] = QStringLiteral("Mixer channel %1 ('%2') deleted successfully. Connected tracks re-routed to Master.")
+		.arg(channelIndex).arg(chName);
+	data[QStringLiteral("deleted_channel_index")] = channelIndex;
+	data[QStringLiteral("remaining_channels")] = mixer->numChannels();
+	return data;
+}
+
 void registerMixerTools(AgentToolRegistry& reg)
 {
 	// 1. create_mixer_channel
@@ -895,6 +1060,69 @@ void registerMixerTools(AgentToolRegistry& reg)
 			QJsonObject(),
 			QJsonArray(),
 			handleGetMixerInfo
+		);
+	}
+
+	// 8. get_mixer_peak_levels
+	{
+		reg.registerTool(
+			QStringLiteral("get_mixer_peak_levels"),
+			QStringLiteral("Returns real-time peak linear and decibel levels (dBFS) for the Master channel and all numbered mixer channels to enable dynamic gain staging."),
+			QJsonObject(),
+			QJsonArray(),
+			handleGetMixerPeakLevels
+		);
+	}
+
+	// 9. reorder_mixer_effects
+	{
+		QJsonObject props;
+		QJsonObject propChan;
+		propChan[QStringLiteral("type")] = QStringLiteral("integer");
+		propChan[QStringLiteral("description")] = QStringLiteral("Mixer channel index holding the effect rack.");
+		props[QStringLiteral("channel_index")] = propChan;
+
+		QJsonObject propFrom;
+		propFrom[QStringLiteral("type")] = QStringLiteral("integer");
+		propFrom[QStringLiteral("description")] = QStringLiteral("Current 0-indexed position of the effect plugin in the chain.");
+		props[QStringLiteral("from_index")] = propFrom;
+
+		QJsonObject propTo;
+		propTo[QStringLiteral("type")] = QStringLiteral("integer");
+		propTo[QStringLiteral("description")] = QStringLiteral("Target 0-indexed position of the effect plugin in the chain.");
+		props[QStringLiteral("to_index")] = propTo;
+
+		QJsonArray req;
+		req.append(QStringLiteral("channel_index"));
+		req.append(QStringLiteral("from_index"));
+		req.append(QStringLiteral("to_index"));
+
+		reg.registerTool(
+			QStringLiteral("reorder_mixer_effects"),
+			QStringLiteral("Moves an effect plugin up or down in a channel's FX chain (e.g. putting EQ before Compressor vs after Reverb)."),
+			props,
+			req,
+			handleReorderMixerEffects
+		);
+	}
+
+	// 10. delete_mixer_channel
+	{
+		QJsonObject props;
+		QJsonObject propChan;
+		propChan[QStringLiteral("type")] = QStringLiteral("integer");
+		propChan[QStringLiteral("description")] = QStringLiteral("Index of the mixer channel to delete (must be > 0; Master channel 0 cannot be deleted).");
+		props[QStringLiteral("channel_index")] = propChan;
+
+		QJsonArray req;
+		req.append(QStringLiteral("channel_index"));
+
+		reg.registerTool(
+			QStringLiteral("delete_mixer_channel"),
+			QStringLiteral("Deletes an unused mixer channel and safely re-routes connected tracks back to Master."),
+			props,
+			req,
+			handleDeleteMixerChannel
 		);
 	}
 }

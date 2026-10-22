@@ -7,6 +7,7 @@ set(LMMS_SRCS
 	core/AgentTrackTools.cpp
 	core/AgentInstrumentTools.cpp
 	core/AgentMixerTools.cpp
+	core/AgentVstTools.cpp
 	core/AudioBuffer.cpp
 	core/AudioBusHandle.cpp
 	core/AudioEngine.cpp

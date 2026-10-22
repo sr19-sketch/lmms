@@ -17,6 +17,7 @@
 #include "AgentTrackTools.h"
 #include "AgentInstrumentTools.h"
 #include "AgentMixerTools.h"
+#include "AgentVstTools.h"
 
 #include <QtWebSockets/QWebSocketServer>
 #include <QtWebSockets/QWebSocket>
@@ -71,6 +72,7 @@ void AgentWebSocketServer::initTools()
 	registerTrackTools(reg);
 	registerInstrumentTools(reg);
 	registerMixerTools(reg);
+	registerVstTools(reg);
 
 	qDebug() << "[AgentServer] Registered" << reg.toolCount() << "agent tools.";
 }
